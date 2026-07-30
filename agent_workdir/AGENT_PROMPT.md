@@ -1,4 +1,4 @@
-# Agent 启动提示词（LayerNorm2d）
+# Agent 启动提示词
 
 在 Cursor **Agent** 模式聊天中粘贴：
 
@@ -13,6 +13,7 @@
 - model_new.py 你在这里实现，定制实现通过torch_extension替换
 - kernels/ 已清空，请从零实现 CUDA kernel + *_binding.cpp
 - 不要改 utils/、binding.cpp、binding_registry.h、model.py
+- 每次结果正确且有优化时，git 推送一次修改，并注明主要优化点
 
 流程（严格按 skill）：
 1. 在 kernels/ 实现涉及到的定制算子
