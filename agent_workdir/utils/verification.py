@@ -20,7 +20,7 @@ def transform_tensors(tensors, fn):
 
 
 def check_equal(actual, expected):
-    assert type(actual) == type(expected), f"{type(actual)=} != {type(expected)=}"
+    assert type(actual) is type(expected), f"{type(actual)=} != {type(expected)=}"
     if isinstance(actual, (list, tuple)):
         assert len(actual) == len(expected), f"{len(actual)=} != {len(expected)=}"
         for x, y in zip(actual, expected):
@@ -49,9 +49,7 @@ def block_torch_functional(excludes=None):
             originals[name] = attr
 
             def wrapper(*args, __name=name, **kwargs):
-                raise RuntimeError(
-                    f"Function torch.nn.functional.{__name} is not allowed in this context."
-                )
+                raise RuntimeError(f"Function torch.nn.functional.{__name} is not allowed in this context.")
 
             setattr(F, name, wrapper)
 
@@ -67,9 +65,11 @@ def initialize_models():
     if not isinstance(init_inputs, (list, tuple)):
         init_inputs = [init_inputs]
 
+    # Shared weights, then FP16 for baseline Model / torch.compile path.
     torch_model = Model(*init_inputs).eval().cuda()
     cuda_model = ModelNew(*init_inputs).eval().cuda()
     cuda_model.load_state_dict(torch_model.state_dict())
+    torch_model.half()
     return torch_model, cuda_model
 
 
@@ -77,7 +77,7 @@ def build_inputs():
     torch_inputs = get_inputs()
     if not isinstance(torch_inputs, (list, tuple)):
         torch_inputs = [torch_inputs]
-    torch_inputs = transform_tensors(torch_inputs, lambda x: x.cuda())
+    torch_inputs = transform_tensors(torch_inputs, lambda x: x.cuda().half())
     cuda_inputs = transform_tensors(torch_inputs, lambda x: x.clone())
     return torch_inputs, cuda_inputs
 

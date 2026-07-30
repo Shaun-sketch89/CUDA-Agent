@@ -2,96 +2,156 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-template <typename T> __device__ __forceinline__ float to_float(T v);
-template <> __device__ __forceinline__ float to_float<float>(float v) {
-  return v;
-}
-template <> __device__ __forceinline__ float to_float<__half>(__half v) {
-  return __half2float(v);
-}
-
-template <typename T> __device__ __forceinline__ T from_float(float v);
-template <> __device__ __forceinline__ float from_float<float>(float v) {
-  return v;
-}
-template <> __device__ __forceinline__ __half from_float<__half>(float v) {
-  return __float2half(v);
-}
-
-// Each thread owns one (n,h,w) and loops over C (typically 32..256).
-template <typename T>
-__global__ void
-layernorm2d_kernel(T *__restrict__ out, const T *__restrict__ in,
-                   const T *__restrict__ weight, const T *__restrict__ bias,
-                   int N, int C, int H, int W, float eps) {
-  const int spatial = H * W;
-  const int total = N * spatial;
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+template <int C>
+__global__ void layernorm2d_nhwc_c_kernel(__half *__restrict__ out,
+                                          const __half *__restrict__ in,
+                                          const __half *__restrict__ weight,
+                                          const __half *__restrict__ bias,
+                                          int nhw, float eps) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < nhw;
        idx += blockDim.x * gridDim.x) {
-    const int n = idx / spatial;
-    const int hw = idx - n * spatial;
-    const T *in_base = in + n * C * spatial + hw;
-    T *out_base = out + n * C * spatial + hw;
+    const __half *row = in + idx * C;
+    __half *orow = out + idx * C;
 
     float sum = 0.f;
-#pragma unroll 4
-    for (int c = 0; c < C; ++c) {
-      sum += to_float(in_base[c * spatial]);
+#pragma unroll
+    for (int c = 0; c < C; c += 2) {
+      __half2 v = *reinterpret_cast<const __half2 *>(row + c);
+      sum += __low2float(v) + __high2float(v);
     }
-    float mean = sum / (float)C;
+    float mean = sum * (1.f / (float)C);
 
     float var_sum = 0.f;
-#pragma unroll 4
-    for (int c = 0; c < C; ++c) {
-      float d = to_float(in_base[c * spatial]) - mean;
-      var_sum += d * d;
+#pragma unroll
+    for (int c = 0; c < C; c += 2) {
+      __half2 v = *reinterpret_cast<const __half2 *>(row + c);
+      float a = __low2float(v) - mean;
+      float b = __high2float(v) - mean;
+      var_sum += a * a + b * b;
     }
-    float inv_std = rsqrtf(var_sum / (float)C + eps);
+    float inv_std = rsqrtf(var_sum * (1.f / (float)C) + eps);
 
-#pragma unroll 4
-    for (int c = 0; c < C; ++c) {
-      float x = to_float(in_base[c * spatial]);
-      float y = (x - mean) * inv_std;
-      y = y * to_float(weight[c]) + to_float(bias[c]);
-      out_base[c * spatial] = from_float<T>(y);
+#pragma unroll
+    for (int c = 0; c < C; c += 2) {
+      __half2 v = *reinterpret_cast<const __half2 *>(row + c);
+      __half2 w = *reinterpret_cast<const __half2 *>(weight + c);
+      __half2 b2 = *reinterpret_cast<const __half2 *>(bias + c);
+      float y0 =
+          (__low2float(v) - mean) * inv_std * __low2float(w) + __low2float(b2);
+      float y1 = (__high2float(v) - mean) * inv_std * __high2float(w) +
+                 __high2float(b2);
+      *reinterpret_cast<__half2 *>(orow + c) =
+          __halves2half2(__float2half(y0), __float2half(y1));
     }
   }
 }
 
-// Vectorized path when spatial is multiple of 2 and we process float2-ish via
-// half2 for fp16
-template <typename T>
-void layernorm2d_launch_typed(T *out, const T *in, const T *weight,
-                              const T *bias, int N, int C, int H, int W,
-                              float eps, int config, cudaStream_t stream) {
-  int total = N * H * W;
-  if (total <= 0)
-    return;
-  int threads = 256;
-  if (config == 1)
-    threads = 128;
-  if (config == 2)
-    threads = 512;
-  int blocks = (total + threads - 1) / threads;
-  // Cap grid size for occupancy
-  if (blocks > 2048)
-    blocks = 2048;
-  layernorm2d_kernel<T>
-      <<<blocks, threads, 0, stream>>>(out, in, weight, bias, N, C, H, W, eps);
+__global__ void layernorm2d_nhwc_half2_kernel(__half *__restrict__ out,
+                                              const __half *__restrict__ in,
+                                              const __half *__restrict__ weight,
+                                              const __half *__restrict__ bias,
+                                              int nhw, int C, float eps) {
+  const int C2 = C >> 1;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < nhw;
+       idx += blockDim.x * gridDim.x) {
+    const __half2 *row = reinterpret_cast<const __half2 *>(in + idx * C);
+    __half2 *orow = reinterpret_cast<__half2 *>(out + idx * C);
+    const __half2 *wrow = reinterpret_cast<const __half2 *>(weight);
+    const __half2 *brow = reinterpret_cast<const __half2 *>(bias);
+    float sum = 0.f;
+    for (int c = 0; c < C2; ++c) {
+      __half2 v = row[c];
+      sum += __low2float(v) + __high2float(v);
+    }
+    float mean = sum * (1.f / (float)C);
+    float var_sum = 0.f;
+    for (int c = 0; c < C2; ++c) {
+      __half2 v = row[c];
+      float a = __low2float(v) - mean;
+      float b = __high2float(v) - mean;
+      var_sum += a * a + b * b;
+    }
+    float inv_std = rsqrtf(var_sum * (1.f / (float)C) + eps);
+    for (int c = 0; c < C2; ++c) {
+      __half2 v = row[c];
+      __half2 w = wrow[c];
+      __half2 b2 = brow[c];
+      float y0 =
+          (__low2float(v) - mean) * inv_std * __low2float(w) + __low2float(b2);
+      float y1 = (__high2float(v) - mean) * inv_std * __high2float(w) +
+                 __high2float(b2);
+      orow[c] = __halves2half2(__float2half(y0), __float2half(y1));
+    }
+  }
+}
+
+__global__ void layernorm2d_float_kernel(float *__restrict__ out,
+                                         const float *__restrict__ in,
+                                         const float *__restrict__ weight,
+                                         const float *__restrict__ bias,
+                                         int nhw, int C, float eps) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < nhw;
+       idx += blockDim.x * gridDim.x) {
+    const float *row = in + idx * C;
+    float *orow = out + idx * C;
+    float sum = 0.f;
+    for (int c = 0; c < C; ++c)
+      sum += row[c];
+    float mean = sum / (float)C;
+    float var_sum = 0.f;
+    for (int c = 0; c < C; ++c) {
+      float d = row[c] - mean;
+      var_sum += d * d;
+    }
+    float inv_std = rsqrtf(var_sum / (float)C + eps);
+    for (int c = 0; c < C; ++c)
+      orow[c] = (row[c] - mean) * inv_std * weight[c] + bias[c];
+  }
 }
 
 extern "C" void layernorm2d_launcher(void *out, const void *in,
                                      const void *weight, const void *bias,
-                                     int N, int C, int H, int W, float eps,
+                                     int N, int H, int W, int C, float eps,
                                      int dtype, int config,
                                      cudaStream_t stream) {
+  int nhw = N * H * W;
+  if (nhw <= 0)
+    return;
+  int threads = config == 1 ? 128 : (config == 2 ? 512 : 256);
+  int blocks = (nhw + threads - 1) / threads;
+  if (blocks > 65535)
+    blocks = 65535;
+
   if (dtype == 1) {
-    layernorm2d_launch_typed<__half>(
-        (__half *)out, (const __half *)in, (const __half *)weight,
-        (const __half *)bias, N, C, H, W, eps, config, stream);
+    if (C == 32) {
+      layernorm2d_nhwc_c_kernel<32><<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, eps);
+    } else if (C == 64) {
+      layernorm2d_nhwc_c_kernel<64><<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, eps);
+    } else if (C == 128) {
+      layernorm2d_nhwc_c_kernel<128><<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, eps);
+    } else if (C == 256) {
+      layernorm2d_nhwc_c_kernel<256><<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, eps);
+    } else if ((C & 1) == 0) {
+      layernorm2d_nhwc_half2_kernel<<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, C, eps);
+    } else {
+      // odd C fallback
+      layernorm2d_nhwc_half2_kernel<<<blocks, threads, 0, stream>>>(
+          (__half *)out, (const __half *)in, (const __half *)weight,
+          (const __half *)bias, nhw, C & ~1, eps);
+    }
   } else {
-    layernorm2d_launch_typed<float>((float *)out, (const float *)in,
-                                    (const float *)weight, (const float *)bias,
-                                    N, C, H, W, eps, config, stream);
+    layernorm2d_float_kernel<<<blocks, threads, 0, stream>>>(
+        (float *)out, (const float *)in, (const float *)weight,
+        (const float *)bias, nhw, C, eps);
   }
 }

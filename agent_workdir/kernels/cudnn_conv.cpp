@@ -1,13 +1,10 @@
-// cuDNN convolution via dynamically loaded cudnn (PyTorch cudnn64_9 / system
-// cudnn64_8).
+// cuDNN convolution via dynamically loaded cudnn (cudnn64_9.dll).
 #include <cstdint>
-#include <cstring>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,7 +17,10 @@
 
 typedef enum { CUDNN_STATUS_SUCCESS = 0 } cudnnStatus_t;
 typedef enum { CUDNN_DATA_FLOAT = 0, CUDNN_DATA_HALF = 2 } cudnnDataType_t;
-typedef enum { CUDNN_TENSOR_NCHW = 0 } cudnnTensorFormat_t;
+typedef enum {
+  CUDNN_TENSOR_NCHW = 0,
+  CUDNN_TENSOR_NHWC = 1
+} cudnnTensorFormat_t;
 typedef enum { CUDNN_CROSS_CORRELATION = 1 } cudnnConvolutionMode_t;
 typedef enum {
   CUDNN_DEFAULT_MATH = 0,
@@ -28,8 +28,7 @@ typedef enum {
 } cudnnMathType_t;
 typedef enum {
   CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = 0,
-  CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = 1,
-  CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED = 7
+  CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = 1
 } cudnnConvolutionFwdAlgo_t;
 
 struct cudnnContext;
@@ -40,16 +39,6 @@ typedef cudnnContext *cudnnHandle_t;
 typedef cudnnTensorStruct *cudnnTensorDescriptor_t;
 typedef cudnnFilterStruct *cudnnFilterDescriptor_t;
 typedef cudnnConvolutionStruct *cudnnConvolutionDescriptor_t;
-
-typedef struct {
-  cudnnConvolutionFwdAlgo_t algo;
-  cudnnStatus_t status;
-  float time;
-  size_t memory;
-  cudnnMathType_t mathType;
-  int determinism;
-  int reserved[32];
-} cudnnConvolutionFwdAlgoPerf_t;
 
 #ifdef _WIN32
 static HMODULE g_cudnn = nullptr;
@@ -93,10 +82,6 @@ CUDNN_FN(cudnnStatus_t, cudnnSetConvolutionGroupCount,
          cudnnConvolutionDescriptor_t, int);
 CUDNN_FN(cudnnStatus_t, cudnnSetConvolutionMathType,
          cudnnConvolutionDescriptor_t, cudnnMathType_t);
-CUDNN_FN(cudnnStatus_t, cudnnGetConvolutionForwardAlgorithm_v7, cudnnHandle_t,
-         const cudnnTensorDescriptor_t, const cudnnFilterDescriptor_t,
-         const cudnnConvolutionDescriptor_t, const cudnnTensorDescriptor_t,
-         const int, int *, cudnnConvolutionFwdAlgoPerf_t *);
 CUDNN_FN(cudnnStatus_t, cudnnGetConvolutionForwardWorkspaceSize, cudnnHandle_t,
          const cudnnTensorDescriptor_t, const cudnnFilterDescriptor_t,
          const cudnnConvolutionDescriptor_t, const cudnnTensorDescriptor_t,
@@ -106,11 +91,8 @@ CUDNN_FN(cudnnStatus_t, cudnnConvolutionForward, cudnnHandle_t, const void *,
          const cudnnFilterDescriptor_t, const void *,
          const cudnnConvolutionDescriptor_t, cudnnConvolutionFwdAlgo_t, void *,
          size_t, const void *, const cudnnTensorDescriptor_t, void *);
-CUDNN_FN(cudnnStatus_t, cudnnAddTensor, cudnnHandle_t, const void *,
-         const cudnnTensorDescriptor_t, const void *, const void *,
-         const cudnnTensorDescriptor_t, void *);
 
-void ensure_cudnn_loaded() {
+static void ensure_cudnn_loaded() {
   if (g_cudnn)
     return;
 #ifdef _WIN32
@@ -166,24 +148,20 @@ void ensure_cudnn_loaded() {
           "cudnnSetConvolutionGroupCount");
   cudnnSetConvolutionMathType = load_sym<decltype(cudnnSetConvolutionMathType)>(
       "cudnnSetConvolutionMathType");
-  cudnnGetConvolutionForwardAlgorithm_v7 =
-      load_sym<decltype(cudnnGetConvolutionForwardAlgorithm_v7)>(
-          "cudnnGetConvolutionForwardAlgorithm_v7");
   cudnnGetConvolutionForwardWorkspaceSize =
       load_sym<decltype(cudnnGetConvolutionForwardWorkspaceSize)>(
           "cudnnGetConvolutionForwardWorkspaceSize");
   cudnnConvolutionForward =
       load_sym<decltype(cudnnConvolutionForward)>("cudnnConvolutionForward");
-  cudnnAddTensor = load_sym<decltype(cudnnAddTensor)>("cudnnAddTensor");
 }
 
-inline void check_cudnn(cudnnStatus_t s, const char *msg) {
+static void check_cudnn(cudnnStatus_t s, const char *msg) {
   if (s != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(s));
   }
 }
 
-cudnnHandle_t get_cudnn_handle(cudaStream_t stream) {
+static cudnnHandle_t get_cudnn_handle(cudaStream_t stream) {
   ensure_cudnn_loaded();
   static thread_local cudnnHandle_t handle = nullptr;
   if (!handle)
@@ -194,13 +172,13 @@ cudnnHandle_t get_cudnn_handle(cudaStream_t stream) {
 
 struct ConvKey {
   int n, c, h, w, k, r, s, pad_h, pad_w, stride_h, stride_w, dilation_h,
-      dilation_w, groups, dtype;
+      dilation_w, groups, dtype, nhwc;
   bool operator==(const ConvKey &o) const {
     return n == o.n && c == o.c && h == o.h && w == o.w && k == o.k &&
            r == o.r && s == o.s && pad_h == o.pad_h && pad_w == o.pad_w &&
            stride_h == o.stride_h && stride_w == o.stride_w &&
            dilation_h == o.dilation_h && dilation_w == o.dilation_w &&
-           groups == o.groups && dtype == o.dtype;
+           groups == o.groups && dtype == o.dtype && nhwc == o.nhwc;
   }
 };
 
@@ -225,6 +203,7 @@ struct ConvKeyHash {
     mix(k.dilation_w);
     mix(k.groups);
     mix(k.dtype);
+    mix(k.nhwc);
     return h;
   }
 };
@@ -232,28 +211,25 @@ struct ConvKeyHash {
 struct CachedConv {
   cudnnTensorDescriptor_t x_desc = nullptr;
   cudnnTensorDescriptor_t y_desc = nullptr;
-  cudnnTensorDescriptor_t b_desc = nullptr;
   cudnnFilterDescriptor_t w_desc = nullptr;
   cudnnConvolutionDescriptor_t conv_desc = nullptr;
   cudnnConvolutionFwdAlgo_t algo =
       CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
   size_t workspace_size = 0;
-  bool algo_tuned = false;
+  bool ready = false;
 };
 
-std::mutex g_mu;
-std::unordered_map<ConvKey, CachedConv, ConvKeyHash> g_cache;
+static std::mutex g_mu;
+static std::unordered_map<ConvKey, CachedConv, ConvKeyHash> g_cache;
+static void *g_workspace = nullptr;
+static size_t g_workspace_bytes = 0;
 
-void *g_workspace = nullptr;
-size_t g_workspace_bytes = 0;
-
-void ensure_workspace(size_t bytes) {
+static void ensure_workspace(size_t bytes) {
   if (bytes <= g_workspace_bytes)
     return;
   void *new_ptr = nullptr;
   if (bytes > 0) {
     if (cudaMalloc(&new_ptr, bytes) != cudaSuccess) {
-      // Keep old workspace; caller may still succeed with smaller requirement
       if (g_workspace_bytes > 0)
         return;
       throw std::runtime_error("cudaMalloc workspace failed");
@@ -265,7 +241,7 @@ void ensure_workspace(size_t bytes) {
   g_workspace_bytes = bytes;
 }
 
-CachedConv &get_or_create(const ConvKey &key, int out_h, int out_w) {
+static CachedConv &get_or_create(const ConvKey &key, int out_h, int out_w) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_cache.find(key);
   if (it != g_cache.end())
@@ -274,25 +250,22 @@ CachedConv &get_or_create(const ConvKey &key, int out_h, int out_w) {
   ensure_cudnn_loaded();
   CachedConv cc;
   cudnnDataType_t cdt = key.dtype == 1 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+  cudnnTensorFormat_t fmt = key.nhwc ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+
   check_cudnn(cudnnCreateTensorDescriptor(&cc.x_desc), "x");
   check_cudnn(cudnnCreateTensorDescriptor(&cc.y_desc), "y");
-  check_cudnn(cudnnCreateTensorDescriptor(&cc.b_desc), "b");
   check_cudnn(cudnnCreateFilterDescriptor(&cc.w_desc), "w");
   check_cudnn(cudnnCreateConvolutionDescriptor(&cc.conv_desc), "conv");
 
-  check_cudnn(cudnnSetTensor4dDescriptor(cc.x_desc, CUDNN_TENSOR_NCHW, cdt,
-                                         key.n, key.c, key.h, key.w),
+  check_cudnn(cudnnSetTensor4dDescriptor(cc.x_desc, fmt, cdt, key.n, key.c,
+                                         key.h, key.w),
               "sx");
-  check_cudnn(cudnnSetTensor4dDescriptor(cc.y_desc, CUDNN_TENSOR_NCHW, cdt,
-                                         key.n, key.k, out_h, out_w),
+  check_cudnn(cudnnSetTensor4dDescriptor(cc.y_desc, fmt, cdt, key.n, key.k,
+                                         out_h, out_w),
               "sy");
-  check_cudnn(cudnnSetFilter4dDescriptor(cc.w_desc, cdt, CUDNN_TENSOR_NCHW,
-                                         key.k, key.c / key.groups, key.r,
-                                         key.s),
+  check_cudnn(cudnnSetFilter4dDescriptor(cc.w_desc, cdt, fmt, key.k,
+                                         key.c / key.groups, key.r, key.s),
               "sw");
-  check_cudnn(cudnnSetTensor4dDescriptor(cc.b_desc, CUDNN_TENSOR_NCHW, cdt, 1,
-                                         key.k, 1, 1),
-              "sb");
   check_cudnn(cudnnSetConvolution2dDescriptor(
                   cc.conv_desc, key.pad_h, key.pad_w, key.stride_h,
                   key.stride_w, key.dilation_h, key.dilation_w,
@@ -305,40 +278,30 @@ CachedConv &get_or_create(const ConvKey &key, int out_h, int out_w) {
                                     : CUDNN_DEFAULT_MATH),
               "sm");
 
-  // Strong defaults before heuristic
-  if (key.r == 1 && key.s == 1) {
-    cc.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-  } else if (key.groups > 1) {
-    // Depthwise / grouped: avoid DIRECT (very slow on large maps)
-    cc.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-  } else {
-    cc.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-  }
+  cc.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
   return g_cache.emplace(key, cc).first->second;
 }
 
-extern "C" void cudnn_conv2d_launcher(void *output, const void *input,
-                                      const void *weight, const void *bias,
-                                      int n, int c, int h, int w, int k, int r,
-                                      int s, int pad_h, int pad_w, int stride_h,
-                                      int stride_w, int dilation_h,
-                                      int dilation_w, int groups, int dtype,
-                                      int config, cudaStream_t stream) {
+extern "C" void
+cudnn_conv2d_launcher(void *output, const void *input, const void *weight,
+                      const void *bias, int n, int c, int h, int w, int k,
+                      int r, int s, int pad_h, int pad_w, int stride_h,
+                      int stride_w, int dilation_h, int dilation_w, int groups,
+                      int dtype, int nhwc, int config, cudaStream_t stream) {
+  (void)bias;
+  (void)config;
   auto handle = get_cudnn_handle(stream);
   int out_h = (h + 2 * pad_h - dilation_h * (r - 1) - 1) / stride_h + 1;
   int out_w = (w + 2 * pad_w - dilation_w * (s - 1) - 1) / stride_w + 1;
 
-  ConvKey key{n,        c,          h,          w,      k,
-              r,        s,          pad_h,      pad_w,  stride_h,
-              stride_w, dilation_h, dilation_w, groups, dtype};
+  ConvKey key{n,          c,      h,     w,        k,        r,
+              s,          pad_h,  pad_w, stride_h, stride_w, dilation_h,
+              dilation_w, groups, dtype, nhwc};
   CachedConv &cc = get_or_create(key, out_h, out_w);
 
-  if (!cc.algo_tuned) {
+  if (!cc.ready) {
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!cc.algo_tuned) {
-      // Always use IMPLICIT_PRECOMP_GEMM for FP16 Tensor Cores.
-      // Heuristic GetAlgorithm_v7 often selects grouped DIRECT which is
-      // extremely slow for depthwise 3x3 on large spatial maps.
+    if (!cc.ready) {
       cc.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
       size_t ws = 0;
       auto st = cudnnGetConvolutionForwardWorkspaceSize(
@@ -351,7 +314,7 @@ extern "C" void cudnn_conv2d_launcher(void *output, const void *input,
                     "ws");
       }
       cc.workspace_size = ws;
-      cc.algo_tuned = true;
+      cc.ready = true;
     }
   }
 
@@ -363,7 +326,4 @@ extern "C" void cudnn_conv2d_launcher(void *output, const void *input,
                                       g_workspace, cc.workspace_size, &beta,
                                       cc.y_desc, output),
               "fwd");
-  // Bias applied by caller via fast custom kernel (cudnnAddTensor is slow
-  // here).
-  (void)bias;
 }

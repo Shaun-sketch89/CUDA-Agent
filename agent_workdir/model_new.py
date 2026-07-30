@@ -1,10 +1,9 @@
-"""CUDA-optimized NAFNet (FP16) via custom extension ops."""
+"""CUDA-optimized NAFNet (FP16 NHWC) via custom extension ops."""
 
 import os
 
 import torch
 
-# Ensure PyTorch / CUDA DLLs are discoverable on Windows before loading the extension.
 _torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
 if hasattr(os, "add_dll_directory") and os.path.isdir(_torch_lib):
     os.add_dll_directory(_torch_lib)
@@ -19,7 +18,11 @@ import cuda_extension
 
 
 def _conv2d(x, weight, bias, pad_h=0, pad_w=0, stride_h=1, stride_w=1, groups=1):
-    return cuda_extension.cudnn_conv2d(x, weight, bias, pad_h, pad_w, stride_h, stride_w, 1, 1, groups, 0)
+    return cuda_extension.cudnn_conv2d(x, weight, bias, pad_h, pad_w, stride_h, stride_w, 1, 1, groups, 1, 0)
+
+
+def _krsc(w):
+    return cuda_extension.kcrs_to_krsc(w)
 
 
 class LayerNorm2d(nn.Module):
@@ -53,22 +56,20 @@ class NAFBlock(nn.Module):
         self.dropout2 = nn.Identity()
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
-        self._c = c
-        self._dw = dw_channel
 
     def _prep_half(self):
-        self.conv1_w = self.conv1.weight.detach().half().contiguous()
+        self.conv1_w = _krsc(self.conv1.weight.detach().half().contiguous())
         self.conv1_b = self.conv1.bias.detach().half().contiguous()
-        self.conv2_w = self.conv2.weight.detach().half().contiguous()
+        self.conv2_w = _krsc(self.conv2.weight.detach().half().contiguous())
         self.conv2_b = self.conv2.bias.detach().half().contiguous()
-        self.conv3_w = self.conv3.weight.detach().half().contiguous()
+        self.conv3_w = _krsc(self.conv3.weight.detach().half().contiguous())
         self.conv3_b = self.conv3.bias.detach().half().contiguous()
-        self.conv4_w = self.conv4.weight.detach().half().contiguous()
+        self.conv4_w = _krsc(self.conv4.weight.detach().half().contiguous())
         self.conv4_b = self.conv4.bias.detach().half().contiguous()
-        self.conv5_w = self.conv5.weight.detach().half().contiguous()
+        self.conv5_w = _krsc(self.conv5.weight.detach().half().contiguous())
         self.conv5_b = self.conv5.bias.detach().half().contiguous()
         sca_conv = self.sca[1]
-        self.sca_w = sca_conv.weight.detach().half().contiguous()
+        self.sca_w = _krsc(sca_conv.weight.detach().half().contiguous())
         self.sca_b = sca_conv.bias.detach().half().contiguous()
         self.norm1.weight_h = self.norm1.weight.detach().half().contiguous()
         self.norm1.bias_h = self.norm1.bias.detach().half().contiguous()
@@ -80,21 +81,19 @@ class NAFBlock(nn.Module):
     def forward(self, inp):
         x = self.norm1(inp)
         x = _conv2d(x, self.conv1_w, self.conv1_b)
-        x = cuda_extension.dwconv3x3(x, self.conv2_w, self.conv2_b, 0)
-        x = cuda_extension.simple_gate(x, 0)
+        x = cuda_extension.dwconv3x3_gate(x, self.conv2_w, self.conv2_b, 0)
         x = cuda_extension.sca(x, self.sca_w, self.sca_b, 0)
-        x = _conv2d(x, self.conv3_w, self.conv3_b)
-        y = cuda_extension.residual(inp, x, self.beta_h, 0)
-
+        x = _conv2d(x, self.conv3_w, None)
+        y = cuda_extension.residual_bias(inp, x, self.beta_h, self.conv3_b, 0)
         x = self.norm2(y)
-        x = _conv2d(x, self.conv4_w, self.conv4_b)
-        x = cuda_extension.simple_gate(x, 0)
-        x = _conv2d(x, self.conv5_w, self.conv5_b)
-        return cuda_extension.residual(y, x, self.gamma_h, 0)
+        x = _conv2d(x, self.conv4_w, None)
+        x = cuda_extension.simple_gate_bias(x, self.conv4_b, 0)
+        x = _conv2d(x, self.conv5_w, None)
+        return cuda_extension.residual_bias(y, x, self.gamma_h, self.conv5_b, 0)
 
 
 class ModelNew(nn.Module):
-    """NAFNet optimized with cuDNN FP16 conv + fused custom kernels."""
+    """NAFNet optimized with NHWC cuDNN FP16 conv + custom kernels."""
 
     def __init__(
         self,
@@ -142,18 +141,18 @@ class ModelNew(nn.Module):
     def _ensure_half(self):
         if self._half_ready:
             return
-        self.intro_w = self.intro.weight.detach().half().contiguous()
+        self.intro_w = _krsc(self.intro.weight.detach().half().contiguous())
         self.intro_b = self.intro.bias.detach().half().contiguous()
-        self.ending_w = self.ending.weight.detach().half().contiguous()
+        self.ending_w = _krsc(self.ending.weight.detach().half().contiguous())
         self.ending_b = self.ending.bias.detach().half().contiguous()
         self.down_w = []
         self.down_b = []
         for d in self.downs:
-            self.down_w.append(d.weight.detach().half().contiguous())
+            self.down_w.append(_krsc(d.weight.detach().half().contiguous()))
             self.down_b.append(d.bias.detach().half().contiguous())
         self.up_w = []
         for u in self.ups:
-            self.up_w.append(u[0].weight.detach().half().contiguous())
+            self.up_w.append(_krsc(u[0].weight.detach().half().contiguous()))
         for enc in self.encoders:
             for blk in enc:
                 blk._prep_half()
@@ -166,13 +165,13 @@ class ModelNew(nn.Module):
 
     def forward(self, inp):
         self._ensure_half()
-        # Shapes only (allowed); compute via extension
-        B = inp.shape[0]
-        C = inp.shape[1]
         H = inp.shape[2]
         W = inp.shape[3]
+        want_float = inp.dtype == torch.float32
 
-        x = cuda_extension.to_half(inp)
+        x = inp if inp.dtype == torch.float16 else cuda_extension.to_half(inp)
+        x = cuda_extension.nchw_to_nhwc(x)
+
         mod_pad_h = (self.padder_size - H % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - W % self.padder_size) % self.padder_size
         if mod_pad_h != 0 or mod_pad_w != 0:
@@ -200,4 +199,7 @@ class ModelNew(nn.Module):
         x = _conv2d(x, self.ending_w, self.ending_b, pad_h=1, pad_w=1)
         x = cuda_extension.add(x, inp_pad, 0)
         x = cuda_extension.crop(x, H, W, 0)
-        return cuda_extension.to_float(x)
+        x = cuda_extension.nhwc_to_nchw(x)
+        if want_float:
+            x = cuda_extension.to_float(x)
+        return x
